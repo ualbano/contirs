@@ -61,6 +61,23 @@ When the new container fails the startup check, Conti:
 2. Renames the stopped backup container back to its original name.
 3. Restarts it.
 
+## Failed update protection
+
+After a rollback, Conti records the failed `(container, image digest)` pair in
+`/var/lib/conti/failed.txt`. On the next run, if the registry still serves the
+same digest, the update is skipped with a warning. Once a new upstream release
+produces a different digest, the update is attempted normally.
+
+To retry a blocked update manually, remove the relevant line from the file:
+
+```sh
+# inside the conti container
+vi /var/lib/conti/failed.txt
+```
+
+When using the Docker deployment the file is stored in the named volume
+`conti_data` and persists across container restarts.
+
 ## Docker deployment
 
 The provided `Dockerfile` builds a minimal Alpine image. Inside the container
