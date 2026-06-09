@@ -61,7 +61,20 @@ When the new container fails the startup check, Conti:
 2. Renames the stopped backup container back to its original name.
 3. Restarts it.
 
+## Docker deployment
+
+The provided `Dockerfile` builds a minimal Alpine image. Inside the container
+crond runs conti every night at 01:00 in the configured timezone.
+
+```sh
+docker compose up -d
+```
+
+The Docker socket is mounted so conti can reach the host daemon. Set the `TZ`
+environment variable in `compose.yml` to match your local timezone (default:
+`Europe/Berlin`).
+
 ## Requirements
 
 - Docker daemon accessible via the local Unix socket (`/var/run/docker.sock`).
-- Rust 1.75 or later.
+- Rust 1.75 or later (only needed for builds outside Docker).
