@@ -107,11 +107,12 @@ CRON_SCHEDULE="0 */6 * * *"  # every 6 hours
 To trigger conti once without waiting for the scheduled time:
 
 ```sh
-docker compose run --rm conti-run
+docker run --rm \
+  -e RUN_ONCE=true \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v conti_data:/var/lib/conti \
+  umbert0/contirs
 ```
-
-The container runs the tool and exits immediately. The `conti-run` service shares
-the same volume as the scheduler so the failed-updates file is respected.
 
 ## Requirements
 
