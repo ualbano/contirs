@@ -102,6 +102,18 @@ CRON_SCHEDULE="0 1 * * 0"    # 01:00 on Sundays only
 CRON_SCHEDULE="0 */6 * * *"  # every 6 hours
 ```
 
+## Manual run
+
+To trigger conti once without waiting for the scheduled time:
+
+```sh
+docker run --rm \
+  -e RUN_ONCE=true \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v conti_data:/var/lib/conti \
+  umbert0/contirs
+```
+
 ## Requirements
 
 - Docker daemon accessible via the local Unix socket (`/var/run/docker.sock`).
