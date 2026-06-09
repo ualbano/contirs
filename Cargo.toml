@@ -1,0 +1,13 @@
+[package]
+name = "conti"
+version = "0.1.0"
+edition = "2021"
+description = "Docker container auto-updater — checks running containers labeled autoupdate=true and recreates them when a new image is available"
+
+[dependencies]
+bollard = "0.17"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
