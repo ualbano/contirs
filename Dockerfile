@@ -21,6 +21,6 @@ RUN apk add --no-cache tzdata
 
 COPY --from=builder /app/target/release/conti /usr/local/bin/conti
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh && mkdir -p /var/lib/conti
 
 ENTRYPOINT ["/entrypoint.sh"]

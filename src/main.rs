@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +15,7 @@ use tracing::{error, info, warn};
 
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const LABEL_TIMEOUT: &str = "autoupdate.timeout";
+const FAILED_UPDATES_FILE: &str = "/var/lib/conti/failed.txt";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,8 +40,10 @@ async fn main() -> Result<()> {
 
     info!("Found {} autoupdate container(s)", ids.len());
 
+    let failed = load_failed_updates();
+
     for id in &ids {
-        if let Err(e) = update_container(&docker, id).await {
+        if let Err(e) = update_container(&docker, id, &failed).await {
             error!("Container {}: {:#}", short_sha(id), e);
         }
     }
@@ -63,7 +67,7 @@ async fn find_autoupdate_containers(docker: &Docker) -> Result<Vec<String>> {
     Ok(list.into_iter().filter_map(|c| c.id).collect())
 }
 
-async fn update_container(docker: &Docker, id: &str) -> Result<()> {
+async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -> Result<()> {
     let info = docker
         .inspect_container(id, None::<InspectContainerOptions>)
         .await
@@ -109,6 +113,15 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
         return Ok(());
     }
 
+    if failed.contains(&failed_key(&name, &new_image_id)) {
+        warn!(
+            container = %name,
+            image = %short_sha(&new_image_id),
+            "Skipping update — a previous attempt with this image failed"
+        );
+        return Ok(());
+    }
+
     info!(
         container = %name,
         old = %short_sha(&old_image_id),
@@ -146,6 +159,7 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
             if let Err(re) = rollback(docker, id, &name).await {
                 error!(container = %name, "Rollback also failed: {:#}", re);
             }
+            mark_update_failed(&name, &new_image_id);
         }
     }
 
@@ -322,6 +336,31 @@ fn container_has_healthcheck(info: &ContainerInspectResponse) -> bool {
         .and_then(|test| test.first())
         .map(|cmd| cmd != "NONE" && !cmd.is_empty())
         .unwrap_or(false)
+}
+
+fn failed_key(container: &str, image_id: &str) -> String {
+    format!("{} {}", container, image_id)
+}
+
+fn load_failed_updates() -> HashSet<String> {
+    match std::fs::read_to_string(FAILED_UPDATES_FILE) {
+        Ok(content) => content.lines().map(str::to_string).collect(),
+        // A missing file is not an error — it simply means no failures have been recorded yet.
+        Err(_) => HashSet::new(),
+    }
+}
+
+fn mark_update_failed(container: &str, image_id: &str) {
+    let entry = format!("{}\n", failed_key(container, image_id));
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(FAILED_UPDATES_FILE)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
+
+    if let Err(e) = result {
+        warn!("Could not write to {}: {}", FAILED_UPDATES_FILE, e);
+    }
 }
 
 async fn rollback(docker: &Docker, id: &str, original_name: &str) -> Result<()> {
