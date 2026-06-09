@@ -47,10 +47,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Container discovery
-// ---------------------------------------------------------------------------
-
 async fn find_autoupdate_containers(docker: &Docker) -> Result<Vec<String>> {
     let mut filters = HashMap::new();
     filters.insert("label", vec!["autoupdate=true"]);
@@ -66,10 +62,6 @@ async fn find_autoupdate_containers(docker: &Docker) -> Result<Vec<String>> {
 
     Ok(list.into_iter().filter_map(|c| c.id).collect())
 }
-
-// ---------------------------------------------------------------------------
-// Main update logic
-// ---------------------------------------------------------------------------
 
 async fn update_container(docker: &Docker, id: &str) -> Result<()> {
     let info = docker
@@ -124,13 +116,12 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
         "New image available — updating"
     );
 
-    // Stop the running container before renaming it.
     docker
         .stop_container(id, None::<StopContainerOptions>)
         .await
         .context("Failed to stop container")?;
 
-    // Rename so the original name is free for the new container.
+    // Rename rather than remove so we can restart it if the new container fails.
     let backup_name = format!("{}_conti_backup", name);
     docker
         .rename_container(
@@ -161,10 +152,6 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Image pull
-// ---------------------------------------------------------------------------
-
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     let (from_image, tag) = parse_image_ref(image);
 
@@ -185,22 +172,16 @@ async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     Ok(())
 }
 
-/// Splits `registry/name:tag` into `(registry/name, tag)`.
-/// Falls back to `"latest"` when no tag is present.
 fn parse_image_ref(image: &str) -> (&str, &str) {
     if let Some(pos) = image.rfind(':') {
         let tag = &image[pos + 1..];
-        // A colon that is part of a registry port contains a slash afterwards.
+        // A colon that is part of a registry port is always followed by a slash.
         if !tag.contains('/') {
             return (&image[..pos], tag);
         }
     }
     (image, "latest")
 }
-
-// ---------------------------------------------------------------------------
-// Container recreation
-// ---------------------------------------------------------------------------
 
 async fn recreate(
     docker: &Docker,
@@ -235,13 +216,10 @@ async fn recreate(
     Ok(created.id)
 }
 
-/// Builds a `Config` for the new container, preserving all relevant settings
-/// from the inspected container: image tag, ports, volumes, env, labels,
-/// entrypoint, restart policy, networks, etc.
 fn build_config(info: &ContainerInspectResponse, image: &str) -> Result<Config<String>> {
     let cfg = info.config.as_ref().context("Missing container config")?;
 
-    // Reconstruct endpoint config so custom network memberships are preserved.
+    // Networks are stored separately from HostConfig and must be re-attached explicitly.
     let networking_config = info.network_settings.as_ref().and_then(|ns| {
         ns.networks.clone().map(|nets| NetworkingConfig {
             endpoints_config: nets,
@@ -264,17 +242,11 @@ fn build_config(info: &ContainerInspectResponse, image: &str) -> Result<Config<S
         stop_timeout: cfg.stop_timeout,
         exposed_ports: cfg.exposed_ports.clone(),
         volumes: cfg.volumes.clone(),
-        // HostConfig carries port bindings, volume mounts, restart policy,
-        // network mode, capabilities, resource limits, and more.
         host_config: info.host_config.clone(),
         networking_config,
         ..Default::default()
     })
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn startup_timeout_from_labels(labels: Option<&HashMap<String, String>>) -> Duration {
     labels
@@ -284,13 +256,6 @@ fn startup_timeout_from_labels(labels: Option<&HashMap<String, String>>) -> Dura
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
 }
 
-/// Waits until the container is confirmed ready, then returns Ok.
-///
-/// - No healthcheck: waits the full timeout, then checks if the container is
-///   still running (original behaviour).
-/// - Healthcheck present: polls every 2 s and returns as soon as Docker
-///   reports `healthy`. Returns an error immediately on `unhealthy` or if
-///   the timeout expires while still `starting`.
 async fn wait_for_ready(
     docker: &Docker,
     id: &str,
@@ -349,7 +314,6 @@ async fn check_still_running(docker: &Docker, id: &str) -> Result<()> {
     bail!("Container exited (exit code {})", code);
 }
 
-/// Returns true when the container config declares an active HEALTHCHECK.
 fn container_has_healthcheck(info: &ContainerInspectResponse) -> bool {
     info.config
         .as_ref()
@@ -360,11 +324,6 @@ fn container_has_healthcheck(info: &ContainerInspectResponse) -> bool {
         .unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------
-// Rollback
-// ---------------------------------------------------------------------------
-
-/// Renames the stopped old container back to its original name and restarts it.
 async fn rollback(docker: &Docker, id: &str, original_name: &str) -> Result<()> {
     docker
         .rename_container(
