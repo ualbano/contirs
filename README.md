@@ -53,6 +53,21 @@ update successful as soon as Docker reports the container as `healthy`. It rolls
 back immediately if the status becomes `unhealthy`, or if the timeout expires
 while the container is still `starting`.
 
+## Docker Compose project groups
+
+When containers share the same `com.docker.compose.project` label, Conti treats them as a group and updates them together in dependency order.
+
+**How it works:**
+
+1. All images in the group are pulled first.
+2. Conti identifies which services have a new image available.
+3. Any service that (transitively) depends on an updated service is also marked for restart, even if its own image has not changed.
+4. Containers are stopped in **reverse** dependency order and renamed to backup names.
+5. Containers are recreated in **forward** dependency order (dependencies first).
+6. If any container fails its startup check, all newly started containers are stopped and removed, and all backup containers are renamed back and restarted.
+
+Conti reads `com.docker.compose.depends_on` to discover the dependency graph. Docker Compose sets this label automatically on every container it creates.
+
 ## Rollback
 
 When the new container fails the startup check, Conti:

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::time::Duration;
 
@@ -17,6 +17,21 @@ use tracing::{error, info, warn};
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const LABEL_TIMEOUT: &str = "autoupdate.timeout";
 const FAILED_UPDATES_FILE: &str = "/var/lib/conti/failed.txt";
+
+const LABEL_PROJECT: &str = "com.docker.compose.project";
+const LABEL_SERVICE: &str = "com.docker.compose.service";
+const LABEL_DEPENDS_ON: &str = "com.docker.compose.depends_on";
+
+struct ContainerNode {
+    id: String,
+    name: String,
+    service: String,
+    image: String,
+    old_image_id: String,
+    depends_on: Vec<String>,
+    startup_timeout: Duration,
+    inspect: ContainerInspectResponse,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,10 +57,23 @@ async fn main() -> Result<()> {
     info!("Found {} autoupdate container(s)", ids.len());
 
     let failed = load_failed_updates();
+    let nodes = inspect_containers(&docker, &ids).await?;
+    let groups = group_by_project(nodes);
 
-    for id in &ids {
-        if let Err(e) = update_container(&docker, id, &failed).await {
-            error!("Container {}: {:#}", short_sha(id), e);
+    for (project, containers) in groups {
+        match project {
+            None => {
+                for node in containers {
+                    if let Err(e) = update_standalone(&docker, node, &failed).await {
+                        error!("{:#}", e);
+                    }
+                }
+            }
+            Some(ref name) => {
+                if let Err(e) = update_project_group(&docker, name, containers, &failed).await {
+                    error!("Project {}: {:#}", name, e);
+                }
+            }
         }
     }
 
@@ -68,78 +96,144 @@ async fn find_autoupdate_containers(docker: &Docker) -> Result<Vec<String>> {
     Ok(list.into_iter().filter_map(|c| c.id).collect())
 }
 
-async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -> Result<()> {
-    let info = docker
-        .inspect_container(id, None::<InspectContainerOptions>)
+async fn inspect_containers(docker: &Docker, ids: &[String]) -> Result<Vec<ContainerNode>> {
+    let mut nodes = Vec::new();
+
+    for id in ids {
+        let inspect = docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to inspect container {}", short_sha(id)))?;
+
+        let labels = inspect.config.as_ref().and_then(|c| c.labels.as_ref());
+
+        let image = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.image.clone())
+            .context("Container has no image configured")?;
+
+        let name = inspect
+            .name
+            .as_deref()
+            .map(|n| n.trim_start_matches('/').to_string())
+            .context("Container has no name")?;
+
+        let old_image_id = inspect
+            .image
+            .as_deref()
+            .context("Container has no image ID")?
+            .to_string();
+
+        let service = labels
+            .and_then(|l| l.get(LABEL_SERVICE))
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+
+        let depends_on = labels
+            .and_then(|l| l.get(LABEL_DEPENDS_ON))
+            .map(|v| parse_depends_on(v))
+            .unwrap_or_default();
+
+        let startup_timeout = startup_timeout_from_labels(labels);
+
+        nodes.push(ContainerNode {
+            id: id.clone(),
+            name,
+            service,
+            image,
+            old_image_id,
+            depends_on,
+            startup_timeout,
+            inspect,
+        });
+    }
+
+    Ok(nodes)
+}
+
+fn group_by_project(nodes: Vec<ContainerNode>) -> Vec<(Option<String>, Vec<ContainerNode>)> {
+    let mut map: HashMap<Option<String>, Vec<ContainerNode>> = HashMap::new();
+
+    for node in nodes {
+        let project = node
+            .inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.as_ref())
+            .and_then(|l| l.get(LABEL_PROJECT))
+            .cloned();
+
+        map.entry(project).or_default().push(node);
+    }
+
+    map.into_iter().collect()
+}
+
+// `com.docker.compose.depends_on` format: "service1:condition,service2:condition"
+fn parse_depends_on(label: &str) -> Vec<String> {
+    label
+        .split(',')
+        .filter_map(|entry| {
+            let service = entry.split(':').next()?.trim();
+            if service.is_empty() { None } else { Some(service.to_string()) }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Standalone update (containers without a compose project label)
+// ---------------------------------------------------------------------------
+
+async fn update_standalone(
+    docker: &Docker,
+    node: ContainerNode,
+    failed: &HashSet<String>,
+) -> Result<()> {
+    info!(container = %node.name, image = %node.image, "Checking for update");
+
+    pull_image(docker, &node.image)
         .await
-        .context("Failed to inspect container")?;
-
-    let image = info
-        .config
-        .as_ref()
-        .and_then(|c| c.image.clone())
-        .context("Container has no image configured")?;
-
-    let name = info
-        .name
-        .as_deref()
-        .map(|n| n.trim_start_matches('/').to_string())
-        .context("Container has no name")?;
-
-    let old_image_id = info
-        .image
-        .as_deref()
-        .context("Container has no current image ID")?
-        .to_string();
-
-    let startup_timeout = startup_timeout_from_labels(
-        info.config.as_ref().and_then(|c| c.labels.as_ref()),
-    );
-
-    info!(container = %name, image = %image, "Checking for update");
-
-    pull_image(docker, &image)
-        .await
-        .with_context(|| format!("Failed to pull image {}", image))?;
+        .with_context(|| format!("Failed to pull image {}", node.image))?;
 
     let new_image_id = docker
-        .inspect_image(&image)
+        .inspect_image(&node.image)
         .await
         .context("Failed to inspect image after pull")?
         .id
         .context("Image has no ID")?;
 
-    if old_image_id == new_image_id {
-        info!(container = %name, "Already up to date");
+    if node.old_image_id == new_image_id {
+        info!(container = %node.name, "Already up to date");
         return Ok(());
     }
 
-    if failed.contains(&failed_key(&name, &new_image_id)) {
+    if failed.contains(&failed_key(&node.name, &new_image_id)) {
         warn!(
-            container = %name,
+            container = %node.name,
             image = %short_sha(&new_image_id),
-            "Skipping update — a previous attempt with this image failed"
+            "Skipping — previous attempt with this image failed"
         );
         return Ok(());
     }
 
     info!(
-        container = %name,
-        old = %short_sha(&old_image_id),
+        container = %node.name,
+        old = %short_sha(&node.old_image_id),
         new = %short_sha(&new_image_id),
         "New image available — updating"
     );
 
     docker
-        .stop_container(id, None::<StopContainerOptions>)
+        .stop_container(&node.id, None::<StopContainerOptions>)
         .await
         .context("Failed to stop container")?;
 
     // Rename rather than remove so we can restart it if the new container fails.
-    let backup_name = format!("{}_conti_backup", name);
+    let backup_name = format!("{}_conti_backup", node.name);
     docker
         .rename_container(
-            id,
+            &node.id,
             RenameContainerOptions {
                 name: backup_name.clone(),
             },
@@ -147,25 +241,244 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
         .await
         .context("Failed to rename old container")?;
 
-    match recreate(docker, &info, &name, &image, startup_timeout).await {
+    match recreate(docker, &node.inspect, &node.name, &node.image, node.startup_timeout).await {
         Ok(new_id) => {
-            info!(container = %name, id = %short_sha(&new_id), "Update successful");
+            info!(container = %node.name, id = %short_sha(&new_id), "Update successful");
             if let Err(e) = docker.remove_container(&backup_name, None).await {
                 warn!("Could not remove old container {}: {}", backup_name, e);
             }
         }
         Err(e) => {
-            error!(container = %name, "Recreation failed: {:#}", e);
-            warn!(container = %name, "Rolling back to previous container");
-            if let Err(re) = rollback(docker, id, &name).await {
-                error!(container = %name, "Rollback also failed: {:#}", re);
+            error!(container = %node.name, "Recreation failed: {:#}", e);
+            warn!(container = %node.name, "Rolling back to previous container");
+            if let Err(re) = rollback(docker, &node.id, &node.name).await {
+                error!(container = %node.name, "Rollback also failed: {:#}", re);
             }
-            mark_update_failed(&name, &new_image_id);
+            mark_update_failed(&node.name, &new_image_id);
         }
     }
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Project group update
+// ---------------------------------------------------------------------------
+
+async fn update_project_group(
+    docker: &Docker,
+    project: &str,
+    nodes: Vec<ContainerNode>,
+    failed: &HashSet<String>,
+) -> Result<()> {
+    info!(project = %project, containers = nodes.len(), "Processing compose project");
+
+    // Pull all images and collect new digests.
+    let mut new_ids: HashMap<String, String> = HashMap::new();
+    for node in &nodes {
+        pull_image(docker, &node.image)
+            .await
+            .with_context(|| format!("Failed to pull {} for {}", node.image, node.name))?;
+
+        let id = docker
+            .inspect_image(&node.image)
+            .await
+            .context("Failed to inspect image")?
+            .id
+            .context("Image has no ID")?;
+
+        new_ids.insert(node.service.clone(), id);
+    }
+
+    // Services that have a genuinely new image and haven't previously failed.
+    let needs_new_image: HashSet<String> = nodes
+        .iter()
+        .filter(|n| {
+            let new_id = new_ids[&n.service].as_str();
+            n.old_image_id != new_id && !failed.contains(&failed_key(&n.name, new_id))
+        })
+        .map(|n| n.service.clone())
+        .collect();
+
+    if needs_new_image.is_empty() {
+        info!(project = %project, "All containers up to date");
+        return Ok(());
+    }
+
+    // Extend the affected set to include every service that (transitively)
+    // depends on a service that is being updated — they must be restarted too.
+    let affected = propagate_affected(&nodes, &needs_new_image);
+
+    let affected_nodes: Vec<&ContainerNode> =
+        nodes.iter().filter(|n| affected.contains(&n.service)).collect();
+
+    let sorted = topo_sort(&affected_nodes)
+        .with_context(|| format!("Could not resolve update order for project {}", project))?;
+
+    info!(
+        project = %project,
+        new_image = needs_new_image.len(),
+        restart_only = sorted.len() - needs_new_image.len(),
+        "Update plan ready"
+    );
+
+    // Stop all affected containers in reverse dependency order and park them
+    // under a backup name so their original names are free for the new containers.
+    let mut backups: Vec<(&ContainerNode, String)> = Vec::new();
+    for node in sorted.iter().rev() {
+        info!(container = %node.name, "Stopping");
+        docker
+            .stop_container(&node.id, None::<StopContainerOptions>)
+            .await
+            .with_context(|| format!("Failed to stop {}", node.name))?;
+
+        let backup_name = format!("{}_conti_backup", node.name);
+        docker
+            .rename_container(
+                &node.id,
+                RenameContainerOptions {
+                    name: backup_name.clone(),
+                },
+            )
+            .await
+            .with_context(|| format!("Failed to rename {}", node.name))?;
+
+        backups.push((node, backup_name));
+    }
+
+    // Recreate containers in dependency order (dependencies before dependents).
+    let mut started: Vec<(&ContainerNode, String)> = Vec::new();
+    for node in &sorted {
+        let image = &node.image;
+        match recreate(docker, &node.inspect, &node.name, image, node.startup_timeout).await {
+            Ok(new_id) => {
+                info!(container = %node.name, id = %short_sha(&new_id), "Started");
+                started.push((node, new_id));
+            }
+            Err(e) => {
+                error!(container = %node.name, "Failed to recreate: {:#}", e);
+                mark_update_failed(&node.name, &new_ids[&node.service]);
+                group_rollback(docker, &started, &backups).await;
+                bail!("Project update failed at '{}', rollback attempted", node.name);
+            }
+        }
+    }
+
+    // All containers are running — remove the backups.
+    for (node, backup_name) in &backups {
+        if let Err(e) = docker.remove_container(backup_name, None).await {
+            warn!("Could not remove backup container {}: {}", backup_name, e);
+        } else {
+            info!(container = %node.name, "Update successful");
+        }
+    }
+
+    info!(project = %project, "All containers updated successfully");
+    Ok(())
+}
+
+// Stops and force-removes all successfully started new containers, then
+// renames all backup containers back to their original names and starts them.
+async fn group_rollback(
+    docker: &Docker,
+    started: &[(&ContainerNode, String)],
+    backups: &[(&ContainerNode, String)],
+) {
+    for (node, new_id) in started.iter().rev() {
+        if let Err(e) = docker.stop_container(new_id, None::<StopContainerOptions>).await {
+            warn!("Rollback: could not stop {}: {}", node.name, e);
+        }
+        force_remove(docker, new_id).await;
+    }
+
+    for (node, _backup_name) in backups {
+        if let Err(e) = docker
+            .rename_container(
+                &node.id,
+                RenameContainerOptions {
+                    name: node.name.clone(),
+                },
+            )
+            .await
+        {
+            warn!("Rollback: could not rename {} back: {}", node.name, e);
+            continue;
+        }
+
+        if let Err(e) = docker
+            .start_container(&node.id, None::<StartContainerOptions<String>>)
+            .await
+        {
+            warn!("Rollback: could not restart {}: {}", node.name, e);
+        } else {
+            info!(container = %node.name, "Rollback: container running again");
+        }
+    }
+}
+
+// Marks all transitive dependents of initially affected services as affected.
+fn propagate_affected(nodes: &[ContainerNode], initially: &HashSet<String>) -> HashSet<String> {
+    let mut affected = initially.clone();
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+        for node in nodes {
+            if !affected.contains(&node.service)
+                && node.depends_on.iter().any(|dep| affected.contains(dep))
+            {
+                affected.insert(node.service.clone());
+                changed = true;
+            }
+        }
+    }
+
+    affected
+}
+
+// Kahn's algorithm — returns nodes ordered so every dependency appears
+// before the services that depend on it.
+fn topo_sort<'a>(nodes: &[&'a ContainerNode]) -> Result<Vec<&'a ContainerNode>> {
+    let index: HashMap<&str, usize> =
+        nodes.iter().enumerate().map(|(i, n)| (n.service.as_str(), i)).collect();
+
+    let mut in_degree = vec![0usize; nodes.len()];
+    // adj[i] holds the indices of nodes that depend on node i.
+    let mut adj: Vec<Vec<usize>> = vec![vec![]; nodes.len()];
+
+    for (i, node) in nodes.iter().enumerate() {
+        for dep in &node.depends_on {
+            if let Some(&j) = index.get(dep.as_str()) {
+                adj[j].push(i);
+                in_degree[i] += 1;
+            }
+        }
+    }
+
+    let mut queue: VecDeque<usize> =
+        (0..nodes.len()).filter(|&i| in_degree[i] == 0).collect();
+
+    let mut result = Vec::new();
+    while let Some(i) = queue.pop_front() {
+        result.push(nodes[i]);
+        for &j in &adj[i] {
+            in_degree[j] -= 1;
+            if in_degree[j] == 0 {
+                queue.push_back(j);
+            }
+        }
+    }
+
+    if result.len() != nodes.len() {
+        bail!("Circular dependency detected");
+    }
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Image pull
+// ---------------------------------------------------------------------------
 
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
     let (from_image, tag) = parse_image_ref(image);
@@ -198,6 +511,10 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
     (image, "latest")
 }
 
+// ---------------------------------------------------------------------------
+// Container recreation
+// ---------------------------------------------------------------------------
+
 async fn recreate(
     docker: &Docker,
     info: &ContainerInspectResponse,
@@ -218,19 +535,16 @@ async fn recreate(
         .await
         .context("Failed to create container")?;
 
-    docker
+    if let Err(e) = docker
         .start_container(&created.id, None::<StartContainerOptions<String>>)
         .await
-        .context("Failed to start container")?;
+    {
+        force_remove(docker, &created.id).await;
+        return Err(anyhow::Error::from(e).context("Failed to start container"));
+    }
 
     if let Err(e) = wait_for_ready(docker, &created.id, info, startup_timeout).await {
-        // Force-remove so the name is freed even if the container is still running.
-        let _ = docker
-            .remove_container(
-                &created.id,
-                Some(RemoveContainerOptions { force: true, ..Default::default() }),
-            )
-            .await;
+        force_remove(docker, &created.id).await;
         return Err(e);
     }
 
@@ -268,6 +582,10 @@ fn build_config(info: &ContainerInspectResponse, image: &str) -> Result<Config<S
         ..Default::default()
     })
 }
+
+// ---------------------------------------------------------------------------
+// Health / readiness check
+// ---------------------------------------------------------------------------
 
 fn startup_timeout_from_labels(labels: Option<&HashMap<String, String>>) -> Duration {
     labels
@@ -345,6 +663,34 @@ fn container_has_healthcheck(info: &ContainerInspectResponse) -> bool {
         .unwrap_or(false)
 }
 
+// ---------------------------------------------------------------------------
+// Rollback (standalone)
+// ---------------------------------------------------------------------------
+
+async fn rollback(docker: &Docker, id: &str, original_name: &str) -> Result<()> {
+    docker
+        .rename_container(
+            id,
+            RenameContainerOptions {
+                name: original_name.to_string(),
+            },
+        )
+        .await
+        .context("Failed to rename container back during rollback")?;
+
+    docker
+        .start_container(id, None::<StartContainerOptions<String>>)
+        .await
+        .context("Failed to restart old container during rollback")?;
+
+    info!(container = %original_name, "Rollback successful — previous container is running again");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Failed update tracking
+// ---------------------------------------------------------------------------
+
 fn failed_key(container: &str, image_id: &str) -> String {
     format!("{} {}", container, image_id)
 }
@@ -370,24 +716,20 @@ fn mark_update_failed(container: &str, image_id: &str) {
     }
 }
 
-async fn rollback(docker: &Docker, id: &str, original_name: &str) -> Result<()> {
-    docker
-        .rename_container(
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async fn force_remove(docker: &Docker, id: &str) {
+    let _ = docker
+        .remove_container(
             id,
-            RenameContainerOptions {
-                name: original_name.to_string(),
-            },
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
         )
-        .await
-        .context("Failed to rename container back during rollback")?;
-
-    docker
-        .start_container(id, None::<StartContainerOptions<String>>)
-        .await
-        .context("Failed to restart old container during rollback")?;
-
-    info!(container = %original_name, "Rollback successful — previous container is running again");
-    Ok(())
+        .await;
 }
 
 fn short_sha(id: &str) -> &str {
