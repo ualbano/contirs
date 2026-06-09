@@ -12,8 +12,8 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
-/// How long to wait after starting a container before checking if it is still alive.
-const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(60);
+const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const LABEL_TIMEOUT: &str = "autoupdate.timeout";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,6 +95,10 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
         .context("Container has no current image ID")?
         .to_string();
 
+    let startup_timeout = startup_timeout_from_labels(
+        info.config.as_ref().and_then(|c| c.labels.as_ref()),
+    );
+
     info!(container = %name, image = %image, "Checking for update");
 
     pull_image(docker, &image)
@@ -138,7 +142,7 @@ async fn update_container(docker: &Docker, id: &str) -> Result<()> {
         .await
         .context("Failed to rename old container")?;
 
-    match recreate(docker, &info, &name, &image).await {
+    match recreate(docker, &info, &name, &image, startup_timeout).await {
         Ok(new_id) => {
             info!(container = %name, id = %short_sha(&new_id), "Update successful");
             if let Err(e) = docker.remove_container(&backup_name, None).await {
@@ -203,6 +207,7 @@ async fn recreate(
     info: &ContainerInspectResponse,
     name: &str,
     image: &str,
+    startup_timeout: Duration,
 ) -> Result<String> {
     let config = build_config(info, image)?;
 
@@ -222,8 +227,7 @@ async fn recreate(
         .await
         .context("Failed to start container")?;
 
-    // Wait briefly to catch containers that exit immediately on startup.
-    tokio::time::sleep(STARTUP_CHECK_DELAY).await;
+    tokio::time::sleep(startup_timeout).await;
 
     let state = docker
         .inspect_container(&created.id, None::<InspectContainerOptions>)
@@ -288,6 +292,18 @@ fn build_config(info: &ContainerInspectResponse, image: &str) -> Result<Config<S
 }
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn startup_timeout_from_labels(labels: Option<&HashMap<String, String>>) -> Duration {
+    labels
+        .and_then(|l| l.get(LABEL_TIMEOUT))
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
+}
+
+// ---------------------------------------------------------------------------
 // Rollback
 // ---------------------------------------------------------------------------
 
@@ -311,10 +327,6 @@ async fn rollback(docker: &Docker, id: &str, original_name: &str) -> Result<()> 
     info!(container = %original_name, "Rollback successful — previous container is running again");
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn short_sha(id: &str) -> &str {
     let s = id.strip_prefix("sha256:").unwrap_or(id);
