@@ -5,7 +5,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use bollard::container::{
     Config, CreateContainerOptions, InspectContainerOptions, ListContainersOptions,
-    NetworkingConfig, RenameContainerOptions, StartContainerOptions, StopContainerOptions,
+    NetworkingConfig, RemoveContainerOptions, RenameContainerOptions, StartContainerOptions,
+    StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, HealthStatusEnum};
@@ -223,7 +224,13 @@ async fn recreate(
         .context("Failed to start container")?;
 
     if let Err(e) = wait_for_ready(docker, &created.id, info, startup_timeout).await {
-        let _ = docker.remove_container(&created.id, None).await;
+        // Force-remove so the name is freed even if the container is still running.
+        let _ = docker
+            .remove_container(
+                &created.id,
+                Some(RemoveContainerOptions { force: true, ..Default::default() }),
+            )
+            .await;
         return Err(e);
     }
 
