@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
 /// How long to wait after starting a container before checking if it is still alive.
-const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(3);
+const STARTUP_CHECK_DELAY: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> Result<()> {
