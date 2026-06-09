@@ -102,6 +102,17 @@ CRON_SCHEDULE="0 1 * * 0"    # 01:00 on Sundays only
 CRON_SCHEDULE="0 */6 * * *"  # every 6 hours
 ```
 
+## Manual run
+
+To trigger conti once without waiting for the scheduled time:
+
+```sh
+docker compose run --rm conti-run
+```
+
+The container runs the tool and exits immediately. The `conti-run` service shares
+the same volume as the scheduler so the failed-updates file is respected.
+
 ## Requirements
 
 - Docker daemon accessible via the local Unix socket (`/var/run/docker.sock`).
