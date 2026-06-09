@@ -1,0 +1,13 @@
+services:
+  conti:
+    build: .
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Berlin
+      CRON_SCHEDULE: "0 1 * * *"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - conti_data:/var/lib/conti
+
+volumes:
+  conti_data:
