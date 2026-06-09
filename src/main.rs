@@ -7,7 +7,7 @@ use bollard::container::{
     NetworkingConfig, RenameContainerOptions, StartContainerOptions, StopContainerOptions,
 };
 use bollard::image::CreateImageOptions;
-use bollard::models::ContainerInspectResponse;
+use bollard::models::{ContainerInspectResponse, HealthStatusEnum};
 use bollard::Docker;
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
@@ -227,28 +227,9 @@ async fn recreate(
         .await
         .context("Failed to start container")?;
 
-    tokio::time::sleep(startup_timeout).await;
-
-    let state = docker
-        .inspect_container(&created.id, None::<InspectContainerOptions>)
-        .await
-        .context("Failed to inspect new container after start")?;
-
-    let running = state
-        .state
-        .as_ref()
-        .and_then(|s| s.running)
-        .unwrap_or(false);
-
-    if !running {
-        let code = state
-            .state
-            .as_ref()
-            .and_then(|s| s.exit_code)
-            .unwrap_or(0);
-        // Clean up the failed container so rollback can reuse the name.
+    if let Err(e) = wait_for_ready(docker, &created.id, info, startup_timeout).await {
         let _ = docker.remove_container(&created.id, None).await;
-        bail!("Container exited immediately (exit code {})", code);
+        return Err(e);
     }
 
     Ok(created.id)
@@ -301,6 +282,82 @@ fn startup_timeout_from_labels(labels: Option<&HashMap<String, String>>) -> Dura
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_STARTUP_TIMEOUT)
+}
+
+/// Waits until the container is confirmed ready, then returns Ok.
+///
+/// - No healthcheck: waits the full timeout, then checks if the container is
+///   still running (original behaviour).
+/// - Healthcheck present: polls every 2 s and returns as soon as Docker
+///   reports `healthy`. Returns an error immediately on `unhealthy` or if
+///   the timeout expires while still `starting`.
+async fn wait_for_ready(
+    docker: &Docker,
+    id: &str,
+    info: &ContainerInspectResponse,
+    timeout: Duration,
+) -> Result<()> {
+    if !container_has_healthcheck(info) {
+        tokio::time::sleep(timeout).await;
+        return check_still_running(docker, id).await;
+    }
+
+    info!("Container has a healthcheck — polling for healthy status");
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let state = docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+            .context("Failed to inspect container during health poll")?;
+
+        if !state.state.as_ref().and_then(|s| s.running).unwrap_or(false) {
+            let code = state.state.as_ref().and_then(|s| s.exit_code).unwrap_or(0);
+            bail!("Container exited (exit code {})", code);
+        }
+
+        match state
+            .state
+            .as_ref()
+            .and_then(|s| s.health.as_ref())
+            .and_then(|h| h.status.as_ref())
+        {
+            Some(HealthStatusEnum::HEALTHY) => return Ok(()),
+            Some(HealthStatusEnum::UNHEALTHY) => bail!("Container is unhealthy"),
+            _ => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            bail!("Container did not become healthy within {}s", timeout.as_secs());
+        }
+    }
+}
+
+async fn check_still_running(docker: &Docker, id: &str) -> Result<()> {
+    let state = docker
+        .inspect_container(id, None::<InspectContainerOptions>)
+        .await
+        .context("Failed to inspect container")?;
+
+    if state.state.as_ref().and_then(|s| s.running).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let code = state.state.as_ref().and_then(|s| s.exit_code).unwrap_or(0);
+    bail!("Container exited (exit code {})", code);
+}
+
+/// Returns true when the container config declares an active HEALTHCHECK.
+fn container_has_healthcheck(info: &ContainerInspectResponse) -> bool {
+    info.config
+        .as_ref()
+        .and_then(|c| c.healthcheck.as_ref())
+        .and_then(|h| h.test.as_ref())
+        .and_then(|test| test.first())
+        .map(|cmd| cmd != "NONE" && !cmd.is_empty())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
