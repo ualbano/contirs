@@ -20,7 +20,7 @@ FROM alpine:3
 RUN apk add --no-cache tzdata
 
 COPY --from=builder /app/target/release/conti /usr/local/bin/conti
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
-RUN echo '0 1 * * * /usr/local/bin/conti' > /etc/crontabs/root
-
-CMD ["crond", "-f", "-d", "6"]
+ENTRYPOINT ["/entrypoint.sh"]

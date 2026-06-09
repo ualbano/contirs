@@ -70,9 +70,20 @@ crond runs conti every night at 01:00 in the configured timezone.
 docker compose up -d
 ```
 
-The Docker socket is mounted so conti can reach the host daemon. Set the `TZ`
-environment variable in `compose.yml` to match your local timezone (default:
-`Europe/Berlin`).
+The Docker socket is mounted so conti can reach the host daemon.
+
+| Variable | Default | Description |
+|---|---|---|
+| `TZ` | `Europe/Berlin` | Timezone for the cron schedule. |
+| `CRON_SCHEDULE` | `0 1 * * *` | Standard cron expression controlling when conti runs. |
+
+Examples:
+
+```sh
+CRON_SCHEDULE="0 3 * * *"    # 03:00 every night
+CRON_SCHEDULE="0 1 * * 0"    # 01:00 on Sundays only
+CRON_SCHEDULE="0 */6 * * *"  # every 6 hours
+```
 
 ## Requirements
 
