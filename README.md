@@ -53,6 +53,27 @@ update successful as soon as Docker reports the container as `healthy`. It rolls
 back immediately if the status becomes `unhealthy`, or if the timeout expires
 while the container is still `starting`.
 
+## Docker Compose project groups
+
+When containers share the same `com.docker.compose.project` label, Conti treats them as a group and updates them together in dependency order.
+
+**How it works:**
+
+1. All images in the group are pulled first.
+2. Conti identifies which services have a new image available.
+3. Any service that (transitively) depends on an updated service is also marked for restart, even if its own image has not changed.
+4. Containers are stopped in **reverse** dependency order and renamed to backup names.
+5. Containers are recreated in **forward** dependency order (dependencies first).
+6. If any container fails its startup check, all newly started containers are stopped and removed, and all backup containers are renamed back and restarted.
+
+Conti reads `com.docker.compose.depends_on` to discover the dependency graph. Docker Compose sets this label automatically on every container it creates.
+
+**Note:** Conti only ever considers containers labeled `autoupdate=true`. A dependency
+on a container without that label is ignored when ordering updates, since that
+container is never touched. Conversely, if a non-labeled container depends on one
+that gets updated, it will **not** be restarted automatically — make sure such
+containers can tolerate a brief reconnect to their dependency, or label them too.
+
 ## Rollback
 
 When the new container fails the startup check, Conti:
@@ -60,6 +81,19 @@ When the new container fails the startup check, Conti:
 1. Removes the failed container.
 2. Renames the stopped backup container back to its original name.
 3. Restarts it.
+
+## `:old` image tag
+
+Whenever Conti updates a container, it tags the image that was running before
+the update as `<repo>:old`. This gives you a manual fallback even after
+Conti's own backup container has been removed:
+
+```sh
+docker run <repo>:old
+```
+
+If a previous `<repo>:old` tag already exists, the image it pointed to is
+removed once the tag has moved, so old images don't accumulate on disk.
 
 ## Failed update protection
 
