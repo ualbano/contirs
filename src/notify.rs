@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use lettre::message::header::ContentType;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
-use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::transport::smtp::client::{Tls, TlsParameters, TlsParametersBuilder};
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 const DEFAULT_PORT: u16 = 587;
@@ -42,6 +42,7 @@ pub struct SmtpConfig {
     to: Vec<Mailbox>,
     encryption: Encryption,
     notify_on: NotifyOn,
+    accept_invalid_certs: bool,
 }
 
 impl SmtpConfig {
@@ -91,6 +92,15 @@ impl SmtpConfig {
             Ok(other) => bail!("Invalid SMTP_NOTIFY '{}' (expected all or errors)", other),
         };
 
+        let accept_invalid_certs = match std::env::var("SMTP_ACCEPT_INVALID_CERTS").as_deref() {
+            Ok("true") => true,
+            Ok("false") | Err(_) => false,
+            Ok(other) => bail!(
+                "Invalid SMTP_ACCEPT_INVALID_CERTS '{}' (expected true or false)",
+                other
+            ),
+        };
+
         Ok(Some(SmtpConfig {
             host,
             port,
@@ -100,14 +110,26 @@ impl SmtpConfig {
             to,
             encryption,
             notify_on,
+            accept_invalid_certs,
         }))
+    }
+
+    fn tls_parameters(&self) -> Result<TlsParameters> {
+        if self.accept_invalid_certs {
+            Ok(TlsParametersBuilder::new(self.host.clone())
+                .dangerous_accept_invalid_certs(true)
+                .dangerous_accept_invalid_hostnames(true)
+                .build()?)
+        } else {
+            Ok(TlsParameters::new(self.host.clone())?)
+        }
     }
 
     fn build_transport(&self) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
         let tls = match self.encryption {
             Encryption::None => Tls::None,
-            Encryption::StartTls => Tls::Required(TlsParameters::new(self.host.clone())?),
-            Encryption::Tls => Tls::Wrapper(TlsParameters::new(self.host.clone())?),
+            Encryption::StartTls => Tls::Required(self.tls_parameters()?),
+            Encryption::Tls => Tls::Wrapper(self.tls_parameters()?),
         };
 
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&self.host)
