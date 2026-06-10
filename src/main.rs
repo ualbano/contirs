@@ -8,7 +8,7 @@ use bollard::container::{
     NetworkingConfig, RemoveContainerOptions, RenameContainerOptions, StartContainerOptions,
     StopContainerOptions,
 };
-use bollard::image::CreateImageOptions;
+use bollard::image::{CreateImageOptions, TagImageOptions};
 use bollard::models::{ContainerInspectResponse, HealthStatusEnum};
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -130,6 +130,10 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
         "New image available — updating"
     );
 
+    if let Err(e) = tag_old_image(docker, &image, &old_image_id).await {
+        warn!(container = %name, "Could not tag previous image as :old: {:#}", e);
+    }
+
     docker
         .stop_container(id, None::<StopContainerOptions>)
         .await
@@ -196,6 +200,42 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
         }
     }
     (image, "latest")
+}
+
+// Tags the image currently in use as `<repo>:old` so it remains available for
+// manual rollback, and removes whatever previously held that tag to avoid
+// accumulating dangling images.
+async fn tag_old_image(docker: &Docker, image: &str, old_image_id: &str) -> Result<()> {
+    let (repo, _) = parse_image_ref(image);
+    let old_tag = format!("{}:old", repo);
+
+    let previous_old_id = docker.inspect_image(&old_tag).await.ok().and_then(|i| i.id);
+
+    docker
+        .tag_image(
+            old_image_id,
+            Some(TagImageOptions {
+                repo: repo.to_string(),
+                tag: "old".to_string(),
+            }),
+        )
+        .await
+        .with_context(|| format!("Failed to tag {} as {}", short_sha(old_image_id), old_tag))?;
+
+    if let Some(prev_id) = previous_old_id {
+        if prev_id != old_image_id {
+            if let Err(e) = docker.remove_image(&prev_id, None, None).await {
+                warn!(
+                    "Could not remove previous {} image {}: {}",
+                    old_tag,
+                    short_sha(&prev_id),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn recreate(
