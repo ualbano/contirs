@@ -91,6 +91,36 @@ vi /var/lib/conti/failed.txt
 When using the Docker deployment the file is stored in the named volume
 `conti_data` and persists across container restarts.
 
+## Email notifications
+
+If `SMTP_HOST` is set, Conti sends a single summary email at the end of each
+run listing every container that was updated and every update that failed. If
+nothing happened (no updates, no failures), no email is sent.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SMTP_HOST` | to enable notifications | – | SMTP server hostname. |
+| `SMTP_PORT` | no | `587` | SMTP server port. |
+| `SMTP_USERNAME` | no | – | Username for SMTP authentication. |
+| `SMTP_PASSWORD` | no | – | Password for SMTP authentication. |
+| `SMTP_FROM` | yes, if `SMTP_HOST` is set | – | Sender address. |
+| `SMTP_TO` | yes, if `SMTP_HOST` is set | – | Recipient address(es), comma-separated. |
+| `SMTP_ENCRYPTION` | no | `starttls` | `starttls`, `tls`, or `none`. |
+| `SMTP_NOTIFY` | no | `all` | `all` sends an email for updates and failures; `errors` only sends an email when at least one update failed. |
+
+These variables are set on the conti container itself, e.g. in `compose.yml`:
+
+```yaml
+services:
+  conti:
+    build: .
+    environment:
+      SMTP_HOST: smtp.example.com
+      SMTP_FROM: conti@example.com
+      SMTP_TO: admin@example.com
+      SMTP_NOTIFY: errors
+```
+
 ## Docker deployment
 
 The provided `Dockerfile` builds a minimal Alpine image. Inside the container

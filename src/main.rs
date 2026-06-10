@@ -14,6 +14,9 @@ use bollard::Docker;
 use futures_util::StreamExt;
 use tracing::{error, info, warn};
 
+mod notify;
+use notify::NotificationEvent;
+
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const LABEL_TIMEOUT: &str = "autoupdate.timeout";
 const FAILED_UPDATES_FILE: &str = "/var/lib/conti/failed.txt";
@@ -26,6 +29,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    let smtp_config = notify::SmtpConfig::from_env().context("Invalid SMTP configuration")?;
 
     let docker =
         Docker::connect_with_local_defaults().context("Failed to connect to Docker daemon")?;
@@ -42,10 +47,25 @@ async fn main() -> Result<()> {
     info!("Found {} autoupdate container(s)", ids.len());
 
     let failed = load_failed_updates();
+    let mut events = Vec::new();
 
     for id in &ids {
-        if let Err(e) = update_container(&docker, id, &failed).await {
-            error!("Container {}: {:#}", short_sha(id), e);
+        match update_container(&docker, id, &failed).await {
+            Ok(Some(event)) => events.push(event),
+            Ok(None) => {}
+            Err(e) => {
+                error!("Container {}: {:#}", short_sha(id), e);
+                events.push(NotificationEvent::Failed {
+                    container: short_sha(id).to_string(),
+                    error: format!("{:#}", e),
+                });
+            }
+        }
+    }
+
+    if let Some(config) = &smtp_config {
+        if let Err(e) = notify::send_summary(config, &events).await {
+            error!("Failed to send notification email: {:#}", e);
         }
     }
 
@@ -68,7 +88,11 @@ async fn find_autoupdate_containers(docker: &Docker) -> Result<Vec<String>> {
     Ok(list.into_iter().filter_map(|c| c.id).collect())
 }
 
-async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -> Result<()> {
+async fn update_container(
+    docker: &Docker,
+    id: &str,
+    failed: &HashSet<String>,
+) -> Result<Option<NotificationEvent>> {
     let info = docker
         .inspect_container(id, None::<InspectContainerOptions>)
         .await
@@ -111,7 +135,7 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
 
     if old_image_id == new_image_id {
         info!(container = %name, "Already up to date");
-        return Ok(());
+        return Ok(None);
     }
 
     if failed.contains(&failed_key(&name, &new_image_id)) {
@@ -120,7 +144,7 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
             image = %short_sha(&new_image_id),
             "Skipping update — a previous attempt with this image failed"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     info!(
@@ -151,11 +175,16 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
         .await
         .context("Failed to rename old container")?;
 
-    match recreate(docker, &info, &name, &image, startup_timeout).await {
+    let event = match recreate(docker, &info, &name, &image, startup_timeout).await {
         Ok(new_id) => {
             info!(container = %name, id = %short_sha(&new_id), "Update successful");
             if let Err(e) = docker.remove_container(&backup_name, None).await {
                 warn!("Could not remove old container {}: {}", backup_name, e);
+            }
+            NotificationEvent::Updated {
+                container: name,
+                old_image: short_sha(&old_image_id).to_string(),
+                new_image: short_sha(&new_image_id).to_string(),
             }
         }
         Err(e) => {
@@ -165,10 +194,14 @@ async fn update_container(docker: &Docker, id: &str, failed: &HashSet<String>) -
                 error!(container = %name, "Rollback also failed: {:#}", re);
             }
             mark_update_failed(&name, &new_image_id);
+            NotificationEvent::Failed {
+                container: name,
+                error: format!("{:#}", e),
+            }
         }
-    }
+    };
 
-    Ok(())
+    Ok(Some(event))
 }
 
 async fn pull_image(docker: &Docker, image: &str) -> Result<()> {
