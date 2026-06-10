@@ -68,6 +68,12 @@ When containers share the same `com.docker.compose.project` label, Conti treats 
 
 Conti reads `com.docker.compose.depends_on` to discover the dependency graph. Docker Compose sets this label automatically on every container it creates.
 
+**Note:** Conti only ever considers containers labeled `autoupdate=true`. A dependency
+on a container without that label is ignored when ordering updates, since that
+container is never touched. Conversely, if a non-labeled container depends on one
+that gets updated, it will **not** be restarted automatically — make sure such
+containers can tolerate a brief reconnect to their dependency, or label them too.
+
 ## Rollback
 
 When the new container fails the startup check, Conti:
