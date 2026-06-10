@@ -82,6 +82,19 @@ When the new container fails the startup check, Conti:
 2. Renames the stopped backup container back to its original name.
 3. Restarts it.
 
+## `:old` image tag
+
+Whenever Conti updates a container, it tags the image that was running before
+the update as `<repo>:old`. This gives you a manual fallback even after
+Conti's own backup container has been removed:
+
+```sh
+docker run <repo>:old
+```
+
+If a previous `<repo>:old` tag already exists, the image it pointed to is
+removed once the tag has moved, so old images don't accumulate on disk.
+
 ## Failed update protection
 
 After a rollback, Conti records the failed `(container, image digest)` pair in
