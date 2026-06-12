@@ -91,6 +91,72 @@ vi /var/lib/conti/failed.txt
 When using the Docker deployment the file is stored in the named volume
 `conti_data` and persists across container restarts.
 
+## Email notifications
+
+If `SMTP_HOST` is set, Conti sends a single summary email at the end of each
+run listing every container that was updated and every update that failed. If
+nothing happened (no updates, no failures), no email is sent.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `SMTP_HOST` | to enable notifications | – | SMTP server hostname. |
+| `SMTP_PORT` | no | `587` | SMTP server port. |
+| `SMTP_USERNAME` | no | – | Username for SMTP authentication. |
+| `SMTP_PASSWORD` | no | – | Password for SMTP authentication. |
+| `SMTP_FROM` | yes, if `SMTP_HOST` is set | – | Sender address. |
+| `SMTP_TO` | yes, if `SMTP_HOST` is set | – | Recipient address(es), comma-separated. |
+| `SMTP_ENCRYPTION` | no | `starttls` | `starttls`, `tls`, or `none`. |
+| `SMTP_NOTIFY` | no | `all` | `all` sends an email for updates and failures; `errors` only sends an email when at least one update failed. |
+| `SMTP_ACCEPT_INVALID_CERTS` | no | `false` | Accept self-signed/invalid TLS certificates (e.g. for Proton Mail Bridge). |
+
+These variables are set on the conti container itself, e.g. in `compose.yml`:
+
+```yaml
+services:
+  conti:
+    build: .
+    environment:
+      SMTP_HOST: smtp.example.com
+      SMTP_FROM: conti@example.com
+      SMTP_TO: admin@example.com
+      SMTP_NOTIFY: errors
+```
+
+### Proton Mail
+
+Proton Mail does not expose SMTP directly; sending requires
+[Proton Mail Bridge](https://proton.me/mail/bridge), which provides a local
+SMTP server with a self-signed certificate. Run Bridge as its own service
+(e.g. the `shenxn/protonmail-bridge` image) and point conti at it:
+
+```yaml
+services:
+  conti:
+    build: .
+    environment:
+      SMTP_HOST: protonmail-bridge
+      SMTP_PORT: "1025"
+      SMTP_USERNAME: you@proton.me
+      SMTP_PASSWORD: "<bridge-generated password>"
+      SMTP_FROM: you@proton.me
+      SMTP_TO: you@proton.me
+      SMTP_ENCRYPTION: starttls
+      SMTP_ACCEPT_INVALID_CERTS: "true"
+
+  protonmail-bridge:
+    image: shenxn/protonmail-bridge
+    volumes:
+      - bridge_data:/root
+
+volumes:
+  bridge_data:
+```
+
+`SMTP_PASSWORD` is the Bridge-specific password shown inside Bridge, not your
+normal Proton Mail password. `SMTP_ACCEPT_INVALID_CERTS` is required because
+Bridge's certificate is self-signed and not issued for the container's
+hostname.
+
 ## Docker deployment
 
 The provided `Dockerfile` builds a minimal Alpine image. Inside the container
